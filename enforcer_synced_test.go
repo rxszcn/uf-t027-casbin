@@ -18,7 +18,9 @@
 package casbin
 
 import (
+	"runtime"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -71,6 +73,190 @@ func TestStopAutoLoadPolicy(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	if e.IsAutoLoadingRunning() {
 		t.Error("auto load is still running")
+	}
+}
+
+// waitForPolicy polls the enforcer until the expected rule is visible again or
+// the deadline is exceeded. It fails the test when the deadline is reached.
+func waitForPolicy(t *testing.T, e *SyncedEnforcer, rule []string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ok, err := e.HasPolicy(interfaceSlice(rule)...)
+		if err != nil {
+			t.Fatalf("HasPolicy failed: %v", err)
+		}
+		if ok {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("policy %v was not reloaded within %v; auto-load is silently dead", rule, timeout)
+}
+
+func interfaceSlice(rule []string) []interface{} {
+	res := make([]interface{}, len(rule))
+	for i, v := range rule {
+		res[i] = v
+	}
+	return res
+}
+
+// TestAutoLoadPolicyRestartReload reproduces the original defect: after a
+// graceful restart (Stop followed immediately by Start) the auto-load goroutine
+// must keep reloading policies instead of being killed by a stale stop signal.
+func TestAutoLoadPolicyRestartReload(t *testing.T) {
+	e, err := NewSyncedEnforcer("examples/basic_model.conf", "examples/basic_policy.csv")
+	if err != nil {
+		t.Fatalf("NewSyncedEnforcer failed: %v", err)
+	}
+
+	e.StartAutoLoadPolicy(5 * time.Millisecond)
+	e.StopAutoLoadPolicy()
+	// Restart without waiting for any scheduling gap: Stop is synchronous now,
+	// so the old goroutine is guaranteed to be gone before the new one starts.
+	e.StartAutoLoadPolicy(5 * time.Millisecond)
+	if !e.IsAutoLoadingRunning() {
+		t.Fatal("auto load is not running after restart")
+	}
+
+	e.ClearPolicy()
+	if ok, _ := e.HasPolicy("bob", "data2", "write"); ok {
+		t.Fatal("policy should have been cleared")
+	}
+	waitForPolicy(t, e, []string{"bob", "data2", "write"}, time.Second)
+
+	e.StopAutoLoadPolicy()
+	if e.IsAutoLoadingRunning() {
+		t.Fatal("auto load is still running after stop")
+	}
+}
+
+// TestAutoLoadPolicyRepeatedRestartCycles hammers start/stop back to back. With
+// the buggy reusable stop channel, a leftover token would eventually make a new
+// goroutine exit immediately and auto-load would never recover.
+func TestAutoLoadPolicyRepeatedRestartCycles(t *testing.T) {
+	e, err := NewSyncedEnforcer("examples/basic_model.conf", "examples/basic_policy.csv")
+	if err != nil {
+		t.Fatalf("NewSyncedEnforcer failed: %v", err)
+	}
+
+	const cycles = 50
+	for i := 0; i < cycles; i++ {
+		e.StartAutoLoadPolicy(time.Millisecond)
+		// Interleave an extra Stop: double stop must be a safe no-op and must
+		// never leave a stop token for the next generation.
+		e.StopAutoLoadPolicy()
+		e.StopAutoLoadPolicy()
+		e.StartAutoLoadPolicy(time.Millisecond)
+		if !e.IsAutoLoadingRunning() {
+			t.Fatalf("cycle %d: auto load is not running after restart", i)
+		}
+		e.StopAutoLoadPolicy()
+		if e.IsAutoLoadingRunning() {
+			t.Fatalf("cycle %d: auto load is still running after stop", i)
+		}
+	}
+
+	// Final generation must actually be functional, not just flagged as running.
+	e.StartAutoLoadPolicy(5 * time.Millisecond)
+	e.ClearPolicy()
+	waitForPolicy(t, e, []string{"bob", "data2", "write"}, time.Second)
+	e.StopAutoLoadPolicy()
+}
+
+// TestAutoLoadPolicyGoroutineLeak verifies that Stop is synchronous and every
+// auto-load goroutine is actually reclaimed, instead of being left blocked on a
+// reusable stop channel (the mechanism behind the silent post-restart failure).
+func TestAutoLoadPolicyGoroutineLeak(t *testing.T) {
+	e, err := NewSyncedEnforcer("examples/basic_model.conf", "examples/basic_policy.csv")
+	if err != nil {
+		t.Fatalf("NewSyncedEnforcer failed: %v", err)
+	}
+
+	// Settle background goroutines unrelated to the enforcer.
+	runtime.GC()
+	base := runtime.NumGoroutine()
+
+	const cycles = 100
+	for i := 0; i < cycles; i++ {
+		e.StartAutoLoadPolicy(time.Millisecond)
+		e.StopAutoLoadPolicy()
+	}
+
+	runtime.GC()
+	// Give the scheduler a moment to finish reaping the final goroutine.
+	time.Sleep(20 * time.Millisecond)
+	if got := runtime.NumGoroutine(); got > base+1 {
+		t.Fatalf("goroutine leak after %d cycles: base=%d now=%d", cycles, base, got)
+	}
+	if e.IsAutoLoadingRunning() {
+		t.Fatal("auto load should be stopped")
+	}
+}
+
+// TestStopAutoLoadPolicyIdempotent makes repeated and out-of-order Stop calls
+// safe: Stop without Start and multiple Stops must neither panic nor block.
+func TestStopAutoLoadPolicyIdempotent(t *testing.T) {
+	e, err := NewSyncedEnforcer("examples/basic_model.conf", "examples/basic_policy.csv")
+	if err != nil {
+		t.Fatalf("NewSyncedEnforcer failed: %v", err)
+	}
+
+	// Stopping a never-started enforcer must be a no-op.
+	e.StopAutoLoadPolicy()
+	e.StopAutoLoadPolicy()
+
+	e.StartAutoLoadPolicy(5 * time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		// Concurrent and repeated stops must not panic on closing the channel.
+		e.StopAutoLoadPolicy()
+		e.StopAutoLoadPolicy()
+		e.StopAutoLoadPolicy()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("StopAutoLoadPolicy blocked on repeated calls")
+	}
+	if e.IsAutoLoadingRunning() {
+		t.Fatal("auto load is still running after stop")
+	}
+}
+
+// TestStartAutoLoadPolicyConcurrentWithStop exercises the start/stop
+// coordination under contention. Whatever the interleaving is, the enforcer
+// must end in a consistent state with at most one live auto-load goroutine.
+func TestStartAutoLoadPolicyConcurrentWithStop(t *testing.T) {
+	e, err := NewSyncedEnforcer("examples/basic_model.conf", "examples/basic_policy.csv")
+	if err != nil {
+		t.Fatalf("NewSyncedEnforcer failed: %v", err)
+	}
+
+	const rounds = 25
+	for i := 0; i < rounds; i++ {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			e.StartAutoLoadPolicy(time.Millisecond)
+		}()
+		go func() {
+			defer wg.Done()
+			e.StopAutoLoadPolicy()
+		}()
+		wg.Wait()
+
+		// Regardless of who won the race, restarting must always succeed and
+		// auto-load must actually keep working afterwards.
+		e.StopAutoLoadPolicy()
+		e.StartAutoLoadPolicy(5 * time.Millisecond)
+		if !e.IsAutoLoadingRunning() {
+			t.Fatalf("round %d: auto load could not be restarted", i)
+		}
+		e.StopAutoLoadPolicy()
 	}
 }
 

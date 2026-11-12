@@ -35,10 +35,11 @@ func NewSyncedContextEnforcer(params ...interface{}) (*SyncedContextEnforcer, er
 	}
 
 	ctxEnforcer := e.(*ContextEnforcer)
+	// stopAutoLoad is created lazily by StartAutoLoadPolicy with a fresh
+	// channel per generation, so no pre-initialization is needed here.
 	return &SyncedContextEnforcer{
 		SyncedEnforcer: &SyncedEnforcer{
-			Enforcer:     ctxEnforcer.Enforcer,
-			stopAutoLoad: make(chan struct{}, 1),
+			Enforcer: ctxEnforcer.Enforcer,
 		},
 		ctxEnforcer: ctxEnforcer,
 	}, nil

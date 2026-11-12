@@ -31,8 +31,15 @@ import (
 // SyncedEnforcer wraps Enforcer and provides synchronized access.
 type SyncedEnforcer struct {
 	*Enforcer
-	m               sync.RWMutex
+	m sync.RWMutex
+
+	// autoLoadMu guards the whole auto-load lifecycle (start/stop) so that a
+	// stop and a subsequent restart can never overlap. stopAutoLoad is replaced
+	// with a fresh channel on every start; autoLoadWG lets Stop wait until the
+	// auto-load goroutine has actually exited before returning.
+	autoLoadMu      sync.Mutex
 	stopAutoLoad    chan struct{}
+	autoLoadWG      sync.WaitGroup
 	autoLoadRunning int32
 }
 
@@ -45,8 +52,9 @@ func NewSyncedEnforcer(params ...interface{}) (*SyncedEnforcer, error) {
 		return nil, err
 	}
 
-	e.stopAutoLoad = make(chan struct{}, 1)
-	e.autoLoadRunning = 0
+	// The stop channel is created lazily by StartAutoLoadPolicy. A fresh channel
+	// per generation guarantees a stop signal can never leak into a later
+	// generation and silently kill the new auto-load goroutine.
 	return e, nil
 }
 
@@ -89,18 +97,29 @@ func (e *SyncedEnforcer) IsAutoLoadingRunning() bool {
 }
 
 // StartAutoLoadPolicy starts a go routine that will every specified duration call LoadPolicy.
+//
+// It is safe to call after StopAutoLoadPolicy, including in tight restart loops:
+// each call gets its own stop channel and Stop is fully synchronous, so a stop
+// signal from a previous generation can never terminate the new goroutine.
 func (e *SyncedEnforcer) StartAutoLoadPolicy(d time.Duration) {
-	// Don't start another goroutine if there is already one running
+	e.autoLoadMu.Lock()
+	defer e.autoLoadMu.Unlock()
+
+	// Don't start another goroutine if there is already one running.
 	if !atomic.CompareAndSwapInt32(&e.autoLoadRunning, 0, 1) {
 		return
 	}
 
+	// A brand-new channel for this generation. A stale signal left over from a
+	// previous Stop cannot reach this goroutine.
+	stopAutoLoad := make(chan struct{})
+	e.stopAutoLoad = stopAutoLoad
+	e.autoLoadWG.Add(1)
+
 	ticker := time.NewTicker(d)
 	go func() {
-		defer func() {
-			ticker.Stop()
-			atomic.StoreInt32(&(e.autoLoadRunning), int32(0))
-		}()
+		defer e.autoLoadWG.Done()
+		defer ticker.Stop()
 		n := 1
 		for {
 			select {
@@ -110,18 +129,33 @@ func (e *SyncedEnforcer) StartAutoLoadPolicy(d time.Duration) {
 				// Uncomment this line to see when the policy is loaded.
 				// log.Print("Load policy for time: ", n)
 				n++
-			case <-e.stopAutoLoad:
+			case <-stopAutoLoad:
 				return
 			}
 		}
 	}()
 }
 
-// StopAutoLoadPolicy causes the go routine to exit.
+// StopAutoLoadPolicy causes the auto-load goroutine to exit and blocks until it
+// has actually exited. It is a no-op when auto-load is not running, so calling
+// it more than once or without a matching Start is always safe.
 func (e *SyncedEnforcer) StopAutoLoadPolicy() {
-	if e.IsAutoLoadingRunning() {
-		e.stopAutoLoad <- struct{}{}
+	e.autoLoadMu.Lock()
+	if atomic.LoadInt32(&e.autoLoadRunning) == 0 {
+		e.autoLoadMu.Unlock()
+		return
 	}
+	stopAutoLoad := e.stopAutoLoad
+	// Mark the generation as stopping under the lock: a concurrent Start will
+	// observe it as busy and a concurrent Stop becomes a no-op below.
+	atomic.StoreInt32(&e.autoLoadRunning, 0)
+	e.autoLoadMu.Unlock()
+
+	close(stopAutoLoad)
+	// Wait for the goroutine of this generation to fully exit. Any Start that
+	// follows is guaranteed to create a new goroutine instead of racing the old
+	// one's deferred cleanup.
+	e.autoLoadWG.Wait()
 }
 
 // SetWatcher sets the current watcher.
